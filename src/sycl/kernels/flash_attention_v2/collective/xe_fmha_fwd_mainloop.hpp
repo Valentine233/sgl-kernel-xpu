@@ -375,12 +375,6 @@ struct FMHAFwdMainloop<
         next_page_idx = get_physical_k_tile(next_page_idx, l_coord, seq_len_kv_cache);
       }
 
-      /* V prefetch for GEMM 2 */
-      CUTLASS_PRAGMA_UNROLL
-      for (int VV = 0; VV < VTiles; VV++) {
-        prefetch(prefetch_v_cache, pVgV_cache(_, _, _, VV, page_idx));
-      }
-
       /* GEMM 1: S = K * Q */
       clear(tSrS);
       CUTLASS_PRAGMA_UNROLL
@@ -390,6 +384,12 @@ struct FMHAFwdMainloop<
         reorder(tQrQ, tSrQ);
         reorder(tKrK, tSrK);
         cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
+      }
+
+      /* V prefetch for GEMM 2 */
+      CUTLASS_PRAGMA_UNROLL
+      for (int VV = 0; VV < VTiles; VV++) {
+        prefetch(prefetch_v_cache, pVgV_cache(_, _, _, VV, page_idx));
       }
 
       /* Causal masking */
@@ -444,7 +444,6 @@ struct FMHAFwdMainloop<
       }
 
       /* K prefetch */
-      CUTLASS_PRAGMA_UNROLL
       for (int D = 0; D < size<4>(pKgK); D++) {
         prefetch(prefetch_k_cache, pKgK_cache(_, _, _, next_page_idx, D));
       }
