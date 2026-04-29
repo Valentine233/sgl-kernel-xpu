@@ -335,15 +335,12 @@ struct FMHAFwdMainloop<
     auto pKgK_cache = prefetch_k_cache.get_slice(thr_id).partition_S(gK_cache);
     auto pVgV_cache = prefetch_v_cache.get_slice(thr_id).partition_S(gV_cache_split);
 
-    int lane_id = thr_id % intel::sg_size;
-    constexpr int sg_tile_q = get<0>(TileShapeQK{}) / SGPerWG::value;
-    int row_base = get<0>(blk_qv) * get<0>(TileShapeQK{}) + (thr_id / intel::sg_size) * sg_tile_q;
-
     // ------
     // Kernel
     // ------
 
     /* Initialization steps for first block: Q/K prefetch, O init */
+    /* TODO: limit D prefetch for large head size, and reorder K prefetches */
     int kblocks_cache = ceil_div(seq_len_kv_cache, get<1>(TileShapeQK{}));
     int page_idx = blk_k0;
     int next_page_idx = blk_k0;
@@ -360,8 +357,12 @@ struct FMHAFwdMainloop<
     fill(tA_max, cutlass::platform::numeric_limits<ElementA>::lowest());
     clear(tA_sum);
 
+    /* Check if */
     bool check_remainder_k = (seq_len % get<1>(TileShapeQK{}) != 0);
+
+    /* Main loop, blocked in k. */
     for (int K = blk_k0; K < blk_k1 && K < kblocks_cache; K++) {
+      /* Split barrier to keep threads together */
       barrier_arrive(ScopeWorkgroup);
 
       bool need_causal = false;
@@ -378,11 +379,13 @@ struct FMHAFwdMainloop<
       auto tKgK_cur = tKgK_cache(_, _, _, page_idx, _);
       auto tVgV_cur = tVgV_cache(_, _, _, _, page_idx);
 
+      /* V prefetch for GEMM 2 */
       CUTLASS_PRAGMA_UNROLL
       for (int VV = 0; VV < VTiles; VV++) {
         prefetch(prefetch_v_cache, pVgV_cache(_, _, _, VV, page_idx));
       }
 
+      /* GEMM 1: S = K * Q */
       clear(tSrS);
       CUTLASS_PRAGMA_UNROLL
       for (int D = 0; D < size<4>(tKgK); D++) {
@@ -393,26 +396,25 @@ struct FMHAFwdMainloop<
         cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
       }
 
+      /* Causal masking */
       if constexpr (CausalMask) {
         if (need_causal) {
-          constexpr int k_tile = get<1>(TileShapeQK{});
-          constexpr int n_reps = k_tile / intel::sg_size;
-          constexpr int elems_per_n = tSrS.size() / n_reps;
-          int k_base = K * k_tile;
+          // Need to get global col and row indices to mask the elements.
+          Tensor cPgP = make_identity_tensor(make_shape(seq_len, seq_len));
+          Tensor gP = local_tile(cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
+          auto cS_thread = thr_mma_qk.partition_C(gP);
           CUTLASS_PRAGMA_UNROLL
-          for (int n = 0; n < n_reps; n++) {
-            int col = k_base + n * intel::sg_size + lane_id;
-            int causal_bound = col - full_tile_offset - row_base;
-            CUTLASS_PRAGMA_UNROLL
-            for (int j = 0; j < elems_per_n; j++) {
-              if (j < causal_bound) {
-                tSrS(n * elems_per_n + j) = ElementS(-INFINITY);
-              }
+          for (int i = 0; i < tSrS.size(); ++i) {
+            int row_idx = get<0>(cS_thread(i));
+            int col_idx = get<1>(cS_thread(i));
+            if (row_idx < col_idx - full_tile_offset) {
+              tSrS(i) = ElementS(-INFINITY);
             }
           }
         }
       }
 
+      /* k masking for remainder tiles */
       if (check_remainder_k && K == blk_k1 - 1) {
         FragSCol k_rem_mask;
         int k = get<0>(tKgK_cache(0, 0, 0, K, 0)) + get_sub_group().get_local_id()[0];
@@ -426,9 +428,11 @@ struct FMHAFwdMainloop<
         }
       }
 
+      /* Apply softmax and scaling (tArA rescaling fused into GEMM 2 VTile loop) */
       auto rescale = softmax(K == blk_k0, tSrS, tA_max, tA_sum);
       reorder(tSrS, tArP);
 
+      /* GEMM 2: A += P * V, split in v dimension. */
       CUTLASS_PRAGMA_UNROLL
       for (int VV = 0; VV < VTiles; VV++) {
         copy(copy_v_cache, tVgV_cur(_, _, _, VV), tVrV);
@@ -442,6 +446,7 @@ struct FMHAFwdMainloop<
         cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
       }
 
+      /* K prefetch */
       CUTLASS_PRAGMA_UNROLL
       for (int D = 0; D < size<4>(pKgK); D++) {
         prefetch(prefetch_k_cache, pKgK_cache(_, _, _, next_page_idx, D));
