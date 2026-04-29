@@ -221,9 +221,6 @@ struct FMHAFwdMainloop<
     // int batch_offset =
     //     params.num_pages_per_seq ? params.num_pages_per_seq[l_coord] : l_coord * (seq_len_kv_cache /
     //     params.page_size);
-    if (next_page_logical_idx >= params.max_num_pages_per_seq) {
-      next_page_logical_idx = params.max_num_pages_per_seq - 1;
-    }
     int batch_offset = l_coord * params.max_num_pages_per_seq;
 
     return params.ptr_page_table[batch_offset + next_page_logical_idx] * tiles_per_page + K % tiles_per_page;
@@ -353,9 +350,11 @@ struct FMHAFwdMainloop<
     for (int D = 0; D < size<4>(pKgK); D++) {
       prefetch(prefetch_k_cache, pKgK_cache(_, _, _, next_page_idx, D));
     }
-    clear(tArA);
-    fill(tA_max, cutlass::platform::numeric_limits<ElementA>::lowest());
-    clear(tA_sum);
+    if (blk_k0 == 0) {
+      clear(tArA);
+      fill(tA_max, cutlass::platform::numeric_limits<ElementA>::lowest());
+      clear(tA_sum);
+    }
 
     /* Check if */
     bool check_remainder_k = (seq_len % get<1>(TileShapeQK{}) != 0);
@@ -376,8 +375,8 @@ struct FMHAFwdMainloop<
         next_page_idx = get_physical_k_tile(next_page_idx, l_coord, seq_len_kv_cache);
       }
 
-      auto tKgK_cur = tKgK_cache(_, _, _, page_idx, _);
-      auto tVgV_cur = tVgV_cache(_, _, _, _, page_idx);
+      // auto tKgK_cur = tKgK_cache(_, _, _, page_idx, _);
+      // auto tVgV_cur = tVgV_cache(_, _, _, _, page_idx);
 
       /* V prefetch for GEMM 2 */
       CUTLASS_PRAGMA_UNROLL
@@ -390,7 +389,7 @@ struct FMHAFwdMainloop<
       CUTLASS_PRAGMA_UNROLL
       for (int D = 0; D < size<4>(tKgK); D++) {
         copy(copy_q, tQgQ(_, _, _, D), tQrQ);
-        copy(copy_k_cache, tKgK_cur(_, _, _, D), tKrK);
+        copy(copy_k_cache, tKgK_cache(_, _, _, page_idx, D), tKrK);
         reorder(tQrQ, tSrQ);
         reorder(tKrK, tSrK);
         cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
@@ -399,7 +398,7 @@ struct FMHAFwdMainloop<
       /* Causal masking */
       if constexpr (CausalMask) {
         if (need_causal) {
-          // Need to get global col and row indices to mask the elements.
+          // Need to get global col and row indices to mask the elements
           Tensor cPgP = make_identity_tensor(make_shape(seq_len, seq_len));
           Tensor gP = local_tile(cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
           auto cS_thread = thr_mma_qk.partition_C(gP);
@@ -428,14 +427,14 @@ struct FMHAFwdMainloop<
         }
       }
 
-      /* Apply softmax and scaling (tArA rescaling fused into GEMM 2 VTile loop) */
+      /* Apply softmax and scaling (tA rescaling fused into GEMM2 VTile loop) */
       auto rescale = softmax(K == blk_k0, tSrS, tA_max, tA_sum);
       reorder(tSrS, tArP);
 
       /* GEMM 2: A += P * V, split in v dimension. */
       CUTLASS_PRAGMA_UNROLL
       for (int VV = 0; VV < VTiles; VV++) {
-        copy(copy_v_cache, tVgV_cur(_, _, _, VV), tVrV);
+        copy(copy_v_cache, tVgV_cache(_, _, _, VV, page_idx), tVrV);
         reorder(tVrV, tArV);
         if (K != blk_k0) {
           CUTLASS_PRAGMA_UNROLL
