@@ -411,9 +411,10 @@ struct FMHAFwdMainloop<
       }
 
       /* k masking for remainder tiles */
-      if (check_remainder_k && K == blk_k1 - 1) {
+      if (check_remainder_k && K == total_blk - 1) {
         FragSCol k_rem_mask;
-        int k = get<0>(tKgK_cache(0, 0, 0, K, 0)) + get_sub_group().get_local_id()[0];
+        int k_val = get<0>(tKgK_cache(0, 0, 0, K, 0));
+        int k = k_val + get_sub_group().get_local_id()[0];
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < k_rem_mask.size(); i++, k += intel::sg_size) {
           k_rem_mask(i) = (k < seq_len) ? ElementS(sycl::nan(0u)) : ElementS(-INFINITY);
