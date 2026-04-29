@@ -375,9 +375,6 @@ struct FMHAFwdMainloop<
         next_page_idx = get_physical_k_tile(next_page_idx, l_coord, seq_len_kv_cache);
       }
 
-      // auto tKgK_cur = tKgK_cache(_, _, _, page_idx, _);
-      // auto tVgV_cur = tVgV_cache(_, _, _, _, page_idx);
-
       /* V prefetch for GEMM 2 */
       CUTLASS_PRAGMA_UNROLL
       for (int VV = 0; VV < VTiles; VV++) {
